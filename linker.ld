@@ -1,29 +1,30 @@
-/* The entry point is the `_start` symbol from kernel_entry.asm */
 ENTRY(_start)
 
 SECTIONS
 {
-    /* The kernel will be loaded at 1MB. */
-    . = 1M;
+	. = 1M;
 
-    .text :
-    {
-        *(.text)   /* All executable code. */
-    }
+	.text BLOCK(4K) : ALIGN(4K)
+	{
+		*(.multiboot)
+		*(.text)
+	}
 
-    .rodata :
-    {
-        *(.rodata*) /* All read-only data. */
-    }
+	.rodata BLOCK(4K) : ALIGN(4K)
+	{
+		*(.rodata)
+	}
 
-    .data :
-    {
-        *(.data)   /* All initialized data. */
-    }
+	.data BLOCK(4K) : ALIGN(4K)
+	{
+		*(.data)
+	}
 
-    .bss :
-    {
-        *(.bss)    /* All uninitialized data. */
-    }
+	.bss BLOCK(4K) : ALIGN(4K)
+	{
+		*(COMMON)
+		*(.bss)
+	}
+    
+    kernel_end = .;
 }
-

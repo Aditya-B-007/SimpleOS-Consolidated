@@ -10,56 +10,44 @@
 // 1. IO.H (Hardware Port I/O)
 // ==========================================
 static inline void outb(uint16_t port, uint8_t val) {
-    __asm__ __volatile__("outb %0, %1" : : "a"(val), "Nd"(port));
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 static inline uint8_t inb(uint16_t port) {
     uint8_t ret;
-    __asm__ __volatile__ ("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
 static inline void outw(uint16_t port, uint16_t val) {
-    __asm__ __volatile__("outw %0, %1" : : "a"(val), "Nd"(port));
+    __asm__ volatile("outw %0, %1" : : "a"(val), "Nd"(port));
 }
 static inline uint16_t inw(uint16_t port) {
     uint16_t ret;
-    __asm__ __volatile__("inw %1, %0" : "=a"(ret) : "Nd"(port));
+    __asm__ volatile("inw %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
 static inline void outl(uint16_t port, uint32_t val) {
-    __asm__ __volatile__("outl %0, %1" : : "a"(val), "Nd"(port));
+    __asm__ volatile("outl %0, %1" : : "a"(val), "Nd"(port));
 }
 static inline uint32_t inl(uint16_t port) {
     uint32_t ret;
-    __asm__ __volatile__("inl %1, %0" : "=a"(ret) : "Nd"(port));
+    __asm__ volatile("inl %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
 
 // ==========================================
 // 2. GRAPHICS.H (VBE & Framebuffer)
 // ==========================================
-typedef struct {
-    uint16_t attributes;
-    uint8_t  windowA, windowB;
-    uint16_t granularity;
-    uint16_t windowSize;
-    uint16_t windowASegment, windowBSegment;
-    uint32_t winFuncPtr;
-    uint16_t pitch;
-    uint16_t resolution_x, resolution_y;
-    uint8_t  wChar, yChar, planes, bitsPerPixel, banks;
-    uint8_t  memoryModel, bankSize, imagePages;
-    uint8_t  reserved1;
-    uint8_t  redMask, redMaskPosition;
-    uint8_t  greenMask, greenMaskPosition;
-    uint8_t  blueMask, blueMaskPosition;
-    uint8_t  rsvdMask, rsvdMaskPosition;
-    uint8_t  directColorAttributes;
+struct screen_info {
+    uint32_t resolution_x;
+    uint32_t resolution_y;
+    uint32_t bpp;
+    uint32_t pitch;
     uint32_t physbase;
-    uint32_t reserved2;
-    uint16_t reserved3;
-} __attribute__((packed)) VbeModeInfo;
+    uint32_t bitsPerPixel;
+};
+typedef struct screen_info VbeModeInfo;
 
-extern VbeModeInfo vbe_mode_info;
+extern struct screen_info screen_info;
 
 typedef struct{
     void* address;
@@ -84,6 +72,7 @@ typedef struct {
 
 void clear_screen(FrameBuffer* fb, uint32_t color);
 void put_pixel(FrameBuffer* fb, int32_t x, int32_t y, uint32_t color);
+uint32_t get_pixel(FrameBuffer* fb, int32_t x, int32_t y);
 void draw_line(FrameBuffer* fb, int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t color);
 void draw_rectangle(FrameBuffer* fb, int32_t x, int32_t y, int32_t width, int32_t height, uint32_t color);
 void fill_rectangle(FrameBuffer* fb, int32_t x, int32_t y, int32_t width, int32_t height, uint32_t color);
@@ -91,19 +80,14 @@ void draw_circle(FrameBuffer* fb, int32_t x, int32_t y, int32_t radius, uint32_t
 void draw_bitmap(FrameBuffer* fb, Bitmap* bmp, int32_t x, int32_t y, uint32_t color);
 void draw_char(FrameBuffer* fb, Font* font, char c, int32_t x, int32_t y, uint32_t color);
 void draw_string(FrameBuffer* fb, Font* font, const char* str, int32_t x, int32_t y, uint32_t color);
+void init_back_buffer(FrameBuffer* fb);
+void swap_buffers(FrameBuffer* fb);
 
 // ==========================================
 // 3. SYNC.H (Spinlocks)
 // ==========================================
-#ifndef __ATOMIC_ACQUIRE
-#define __ATOMIC_ACQUIRE 2
-#endif
-#ifndef __ATOMIC_RELEASE
-#define __ATOMIC_RELEASE 3
-#endif
-
 typedef struct {
-    volatile bool locked;
+    volatile int locked;
 } spinlock_t;
 
 static inline void spinlock_init(spinlock_t* lock) {
@@ -111,27 +95,25 @@ static inline void spinlock_init(spinlock_t* lock) {
 }
 
 static inline void spinlock_acquire(spinlock_t* lock) {
-    while (__atomic_test_and_set(&lock->locked, __ATOMIC_ACQUIRE)) {
-        // "pause" instruction hints the CPU that this is a spin-wait loop.
-        // It improves performance and power consumption on x86 processors.
-        __asm__ __volatile__("pause");
+    while (__sync_lock_test_and_set(&lock->locked, 1)) {
+        while (lock->locked) { __asm__ volatile ("pause"); }
     }
 }
 
 static inline void spinlock_release(spinlock_t* lock) {
-    __atomic_clear(&lock->locked, __ATOMIC_RELEASE);
+    __sync_lock_release(&lock->locked);
 }
 
 static inline unsigned long spinlock_acquire_irqsave(spinlock_t* lock) {
     unsigned long flags;
-    __asm__ __volatile__("pushf; pop %0; cli" : "=r"(flags));
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags));
     spinlock_acquire(lock);
     return flags;
 }
 
 static inline void spinlock_release_irqrestore(spinlock_t* lock, unsigned long flags) {
     spinlock_release(lock);
-    __asm__ __volatile__("push %0; popf" :: "r"(flags));
+    __asm__ volatile ("pushq %0; popfq" : : "r"(flags));
 }
 
 // ==========================================
@@ -189,7 +171,7 @@ struct gdt_entry {
 
 struct gdt_ptr {
     uint16_t limit;
-    uint32_t base;
+    uint64_t base;
 } __attribute__((packed));
 
 void gdt_set_gate(int num, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran);
@@ -199,30 +181,32 @@ void gdt_flush(void);
 struct idt_entry {
     uint16_t base_lo;
     uint16_t sel;
-    uint8_t  always0;
-    uint8_t  flags;
-    uint16_t base_hi;
+    uint8_t  ist;      // Interrupt Stack Table offset
+    uint8_t  flags;    // Type and attributes
+    uint16_t base_mid;
+    uint32_t base_hi;
+    uint32_t reserved;
 } __attribute__((packed));
 
 struct idt_ptr {
     uint16_t limit;
-    uint32_t base;
+    uint64_t base;
 } __attribute__((packed));
 
-typedef struct registers {
-    uint32_t ds;
-    uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;
-    uint32_t int_no, err_code;
-    uint32_t eip, cs, eflags, useresp, ss;
+typedef struct {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    uint64_t int_no, err_code;
+    uint64_t rip, cs, rflags, rsp, ss;
 } registers_t;
 
-typedef void (*isr_t)(registers_t *);
+typedef registers_t* (*isr_t)(registers_t*);
 void idt_install(void);
-void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags);
-void irq_handler(registers_t *r);
-void isr_handler(registers_t *r);
-void irq_install_handler(int irq, void (*handler)(registers_t *r));
-void page_fault_handler(registers_t *r);
+void idt_set_gate(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags);
+registers_t* irq_handler(registers_t *r);
+registers_t* isr_handler(registers_t *r);
+void irq_install_handler(int irq, isr_t handler);
+registers_t* page_fault_handler(registers_t *r);
 void register_interrupt_handler(uint8_t n, isr_t handler);
 
 // ISR Externs
@@ -263,7 +247,7 @@ uint32_t pmm_get_free_memory(void);
 // ==========================================
 // 8. HEAP.H (Kernel Heap)
 // ==========================================
-void heap_init(uint32_t start_address, uint32_t size);
+void heap_init(uintptr_t start_address, uint32_t size);
 void* kmalloc(size_t size);
 void kfree(void* ptr);
 
@@ -291,7 +275,7 @@ typedef struct page_directory {
 } page_directory_t;
 
 void paging_install(void);
-void paging_map(uint32_t phys, uint32_t virt, uint32_t flags);
+void paging_map(uint64_t phys, uint64_t virt, uint64_t flags);
 void switch_page_directory(page_directory_t *dir);
 extern page_directory_t* page_directory;
 
@@ -308,7 +292,7 @@ uint32_t get_ticks();
 #define KEYBOARD_STATUS_PORT 0x64
 
 void keyboard_install(void);
-void keyboard_handler(registers_t *r);
+registers_t* keyboard_handler(registers_t *r);
 char keyboard_getchar(void);
 void keyboard_wait_for_input(void);
 extern unsigned char kbdus[128];
@@ -402,6 +386,20 @@ typedef struct{
     uint32_t hover_border;
 } ButtonData;
 
+typedef struct {
+    char* placeholder;
+    char* text;
+    uint32_t bg_color;
+    uint32_t text_color;
+} TextboxData;
+
+typedef struct {
+    uint32_t bg_color;
+    uint32_t thumb_color;
+    int thumb_pos;
+    int thumb_size;
+} ScrollbarData;
+
 void init_widget_system(void);
 void widget_set_font(Font* font);
 void widget_draw_all(Widget* head, FrameBuffer* fb);
@@ -478,15 +476,17 @@ typedef struct task {
     int id;                 
     registers_t regs;       
     void* kernel_stack;    
-    task_state_t state;     
+    task_state_t state;
+    uint64_t wake_at_tick;
     struct task* next;       
 } task_t;
 
 void tasking_install(void);
 void create_task(char* name, void (*entry_point)(void));
-void schedule(registers_t* r);
+registers_t* schedule(registers_t* r);
 void schedule_and_release_lock(spinlock_t* lock, unsigned long flags);
 task_t* get_current_task(void);
+void sleep(uint32_t ms);
 
 // ==========================================
 // 18. STORAGE.H (ATA & File System)
@@ -516,7 +516,8 @@ void rtc_get_time(uint8_t* hour, uint8_t* minute, uint8_t* second);
 void audio_init(void);
 void audio_play(uint8_t* buffer, uint32_t size);
 void audio_stop(void);
-
+extern FrameBuffer* console_fb;
+extern Font* console_font;
 // ==========================================
 // 21. MUTEX.H
 // ==========================================
@@ -531,5 +532,22 @@ typedef struct mutex {
 void mutex_init(mutex_t* mutex);
 void mutex_lock(mutex_t* mutex);
 void mutex_unlock(mutex_t* mutex);
+
+// ==========================================
+// 22. BOOTPARAM.H (Linux-style Boot Parameters)
+// ==========================================
+struct e820entry {
+    uint64_t addr;
+    uint64_t size;
+    uint32_t type;
+} __attribute__((packed));
+typedef struct e820entry MemoryMapEntry;
+
+struct boot_params {
+    struct screen_info screen_info;
+    uint32_t e820_entries;
+    struct e820entry e820_map[32];
+};
+typedef struct boot_params BootParams;
 
 #endif // KERNEL_H
