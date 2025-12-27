@@ -6,7 +6,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 extern void syscall_handler(registers_t *r);
-extern void schedule(registers_t *r);
+extern registers_t* schedule(registers_t *r);
 extern void window_handle_key(char key);
 extern void shell_handle_input(char c);
 extern void dirty_rect_add(int x, int y, int width, int height);
@@ -14,32 +14,12 @@ extern void dirty_rect_add(int x, int y, int width, int height);
 // ==========================================
 // GLOBAL DEFINITIONS (Moved from kernel.c/others)
 // ==========================================
+extern uint8_t kernel_end[]; // Defined in linker.ld
 struct Widget* widget_list_head = NULL;
 struct Window* window_list_head = NULL;
 struct Window* window_list_tail = NULL;
-struct VbeInfoBlock {
-    uint16_t attributes;
-    uint8_t windowA, windowB;
-    uint16_t granularity;
-    uint16_t windowSize;
-    uint16_t segmentA, segmentB;
-    uint32_t winFuncPtr;
-    uint16_t pitch;
-    uint16_t width, height;
-    uint8_t wChar, yChar, planes, bpp, banks;
-    uint8_t memory_model, bank_size, image_pages;
-    uint8_t reserved0;
-    uint8_t red_mask, red_position;
-    uint8_t green_mask, green_position;
-    uint8_t blue_mask, blue_position;
-    uint8_t rsv_mask, rsv_position;
-    uint8_t directcolor_attributes;
-    uint32_t physbase;
-    uint32_t reserved1;
-    uint16_t reserved2;
-} __attribute__((packed));
-struct VbeInfoBlock vbe_info_block = {0};
-//struct VbeModeInfo vbe_mode_info = {0};
+struct screen_info screen_info = {0};
+
 // ==========================================
 // FILE: lib.c (Standard Library Helpers)
 // ==========================================
@@ -353,13 +333,14 @@ void gdt_set_gate(int num, uint32_t base, uint32_t limit, uint8_t access, uint8_
 
 void gdt_install(void) {
     gp.limit = (sizeof(struct gdt_entry) * GDT_ENTRIES) - 1;
-    gp.base = (uint32_t)&gdt;
+    gp.base = (uint64_t)&gdt;
 
     gdt_set_gate(0, 0, 0, 0, 0);                    
-    gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xCF);    
-    gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF);    
-    gdt_set_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xCF);    
-    gdt_set_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF);    
+    // 0xAF = 10101111b (Granularity=1, LongMode=1, Present=1, Limit=F)
+    gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xAF); // Kernel Code (64-bit)
+    gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF); // Kernel Data
+    gdt_set_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xAF); // User Code
+    gdt_set_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF); // User Data
 
     gdt_flush();
 }
@@ -373,11 +354,10 @@ void gdt_flush(void) {
         "mov %%ax, %%fs\n\t"
         "mov %%ax, %%gs\n\t"
         "mov %%ax, %%ss\n\t"
-        "ljmp $0x08, $1f\n\t"
-        "1:\n\t"
+        // No far jump needed in 64-bit if CS is already 0x08 from entry
         :
         : "m"(gp)
-        : "eax"
+        : "rax", "memory"
     );
 }
 
@@ -446,30 +426,31 @@ static const char *exception_messages[] = {
     "Coprocessor Fault", "Alignment Check", "Machine Check", "Reserved"
 };
 
-void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags) {
+void idt_set_gate(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags) {
     idt[num].base_lo = base & 0xFFFF;
-    idt[num].base_hi = (base >> 16) & 0xFFFF;
+    idt[num].base_mid = (base >> 16) & 0xFFFF;
+    idt[num].base_hi = (base >> 32) & 0xFFFFFFFF;
     idt[num].sel = sel;
-    idt[num].always0 = 0;
+    idt[num].ist = 0;
     idt[num].flags = flags;
+    idt[num].reserved = 0;
 }
 
-void isr_handler(registers_t *r) {
-    if (r == NULL) return;
+registers_t* isr_handler(registers_t *r) {
+    if (r == NULL) return r;
 
     if (r->int_no == 128) {
         syscall_handler(r);
-        return;
+        return r;
     }
 
     if (interrupt_handlers[r->int_no] != 0) {
         isr_t handler = interrupt_handlers[r->int_no];
-        handler(r);
-        return; 
+        return handler(r);
     }
 
     console_write("\n[ISR] Interrupt: ");
-    console_write_dec(r->int_no);
+    console_write_dec((uint32_t)r->int_no);
     console_write("\n");
 
     if (r->int_no < 32) {
@@ -484,41 +465,42 @@ void isr_handler(registers_t *r) {
         __asm__ __volatile__("cli");
         for(;;) { __asm__ __volatile__("hlt"); }
     }
+    return r;
 }
 
-static void (*irq_routines[16])(registers_t *r);
+static isr_t irq_routines[16];
 
 void register_interrupt_handler(uint8_t n, isr_t handler) {
     interrupt_handlers[n] = handler;
 }
 
-void irq_install_handler(int irq, void (*handler)(registers_t *r)) {
+void irq_install_handler(int irq, isr_t handler) {
     if (irq >= 0 && irq < 16) {
         irq_routines[irq] = handler;
     }
 }
 
-void irq_handler(registers_t *r) {
+registers_t* irq_handler(registers_t *r) {
     if (interrupt_handlers[r->int_no]) {
         isr_t handler = interrupt_handlers[r->int_no];
-        handler(r);
-        return;
+        return handler(r);
     }
     
     if (r->int_no >= 32 && r->int_no <= 47) {
-        void (*handler)(registers_t *r) = irq_routines[r->int_no - 32];
+        isr_t handler = irq_routines[r->int_no - 32];
         if (handler) {
-            handler(r);
+            r = handler(r);
         }
     }
 
     if (r->int_no >= 40) outb(0xA0, 0x20); // Slave
     outb(0x20, 0x20); // Master
+    return r;
 }
 
 void idt_install(void) {
     ip.limit = sizeof(struct idt_entry) * 256 - 1;
-    ip.base = (uint32_t)&idt;
+    ip.base = (uint64_t)&idt;
 
     memset(&idt, 0, sizeof(struct idt_entry) * 256);
     memset(interrupt_handlers, 0, sizeof(isr_t) * 256);
@@ -526,38 +508,38 @@ void idt_install(void) {
 
     for(int i=0; i<256; i++) idt_set_gate(i, 0, 0, 0);
 
-    idt_set_gate(0, (uint32_t)isr0, 0x08, 0x8E);
-    idt_set_gate(1, (uint32_t)isr1, 0x08, 0x8E);
-    idt_set_gate(2, (uint32_t)isr2, 0x08, 0x8E);
-    idt_set_gate(3, (uint32_t)isr3, 0x08, 0x8E);
-    idt_set_gate(4, (uint32_t)isr4, 0x08, 0x8E);
-    idt_set_gate(5, (uint32_t)isr5, 0x08, 0x8E);
-    idt_set_gate(6, (uint32_t)isr6, 0x08, 0x8E);
-    idt_set_gate(7, (uint32_t)isr7, 0x08, 0x8E);
-    idt_set_gate(8, (uint32_t)isr8, 0x08, 0x8E);
-    idt_set_gate(9, (uint32_t)isr9, 0x08, 0x8E);
-    idt_set_gate(10, (uint32_t)isr10, 0x08, 0x8E);
-    idt_set_gate(11, (uint32_t)isr11, 0x08, 0x8E);
-    idt_set_gate(12, (uint32_t)isr12, 0x08, 0x8E);
-    idt_set_gate(13, (uint32_t)isr13, 0x08, 0x8E);
-    idt_set_gate(14, (uint32_t)isr14, 0x08, 0x8E); // Page Fault
-    idt_set_gate(15, (uint32_t)isr15, 0x08, 0x8E);
-    idt_set_gate(16, (uint32_t)isr16, 0x08, 0x8E);
-    idt_set_gate(17, (uint32_t)isr17, 0x08, 0x8E);
-    idt_set_gate(18, (uint32_t)isr18, 0x08, 0x8E);
-    idt_set_gate(19, (uint32_t)isr19, 0x08, 0x8E);
-    idt_set_gate(20, (uint32_t)isr20, 0x08, 0x8E);
-    idt_set_gate(21, (uint32_t)isr21, 0x08, 0x8E);
-    idt_set_gate(22, (uint32_t)isr22, 0x08, 0x8E);
-    idt_set_gate(23, (uint32_t)isr23, 0x08, 0x8E);
-    idt_set_gate(24, (uint32_t)isr24, 0x08, 0x8E);
-    idt_set_gate(25, (uint32_t)isr25, 0x08, 0x8E);
-    idt_set_gate(26, (uint32_t)isr26, 0x08, 0x8E);
-    idt_set_gate(27, (uint32_t)isr27, 0x08, 0x8E);
-    idt_set_gate(28, (uint32_t)isr28, 0x08, 0x8E);
-    idt_set_gate(29, (uint32_t)isr29, 0x08, 0x8E);
-    idt_set_gate(30, (uint32_t)isr30, 0x08, 0x8E);
-    idt_set_gate(31, (uint32_t)isr31, 0x08, 0x8E);
+    idt_set_gate(0, (uint64_t)isr0, 0x08, 0x8E);
+    idt_set_gate(1, (uint64_t)isr1, 0x08, 0x8E);
+    idt_set_gate(2, (uint64_t)isr2, 0x08, 0x8E);
+    idt_set_gate(3, (uint64_t)isr3, 0x08, 0x8E);
+    idt_set_gate(4, (uint64_t)isr4, 0x08, 0x8E);
+    idt_set_gate(5, (uint64_t)isr5, 0x08, 0x8E);
+    idt_set_gate(6, (uint64_t)isr6, 0x08, 0x8E);
+    idt_set_gate(7, (uint64_t)isr7, 0x08, 0x8E);
+    idt_set_gate(8, (uint64_t)isr8, 0x08, 0x8E);
+    idt_set_gate(9, (uint64_t)isr9, 0x08, 0x8E);
+    idt_set_gate(10, (uint64_t)isr10, 0x08, 0x8E);
+    idt_set_gate(11, (uint64_t)isr11, 0x08, 0x8E);
+    idt_set_gate(12, (uint64_t)isr12, 0x08, 0x8E);
+    idt_set_gate(13, (uint64_t)isr13, 0x08, 0x8E);
+    idt_set_gate(14, (uint64_t)isr14, 0x08, 0x8E); // Page Fault
+    idt_set_gate(15, (uint64_t)isr15, 0x08, 0x8E);
+    idt_set_gate(16, (uint64_t)isr16, 0x08, 0x8E);
+    idt_set_gate(17, (uint64_t)isr17, 0x08, 0x8E);
+    idt_set_gate(18, (uint64_t)isr18, 0x08, 0x8E);
+    idt_set_gate(19, (uint64_t)isr19, 0x08, 0x8E);
+    idt_set_gate(20, (uint64_t)isr20, 0x08, 0x8E);
+    idt_set_gate(21, (uint64_t)isr21, 0x08, 0x8E);
+    idt_set_gate(22, (uint64_t)isr22, 0x08, 0x8E);
+    idt_set_gate(23, (uint64_t)isr23, 0x08, 0x8E);
+    idt_set_gate(24, (uint64_t)isr24, 0x08, 0x8E);
+    idt_set_gate(25, (uint64_t)isr25, 0x08, 0x8E);
+    idt_set_gate(26, (uint64_t)isr26, 0x08, 0x8E);
+    idt_set_gate(27, (uint64_t)isr27, 0x08, 0x8E);
+    idt_set_gate(28, (uint64_t)isr28, 0x08, 0x8E);
+    idt_set_gate(29, (uint64_t)isr29, 0x08, 0x8E);
+    idt_set_gate(30, (uint64_t)isr30, 0x08, 0x8E);
+    idt_set_gate(31, (uint64_t)isr31, 0x08, 0x8E);
 
     // Remap PIC
     outb(0x20, 0x11); outb(0xA0, 0x11);
@@ -570,25 +552,25 @@ void idt_install(void) {
     outb(0xA1, 0xFF);
 
     // Install IRQs
-    idt_set_gate(32, (uint32_t)irq0, 0x08, 0x8E);
-    idt_set_gate(33, (uint32_t)irq1, 0x08, 0x8E);
-    idt_set_gate(34, (uint32_t)irq2, 0x08, 0x8E);
-    idt_set_gate(35, (uint32_t)irq3, 0x08, 0x8E);
-    idt_set_gate(36, (uint32_t)irq4, 0x08, 0x8E);
-    idt_set_gate(37, (uint32_t)irq5, 0x08, 0x8E);
-    idt_set_gate(38, (uint32_t)irq6, 0x08, 0x8E);
-    idt_set_gate(39, (uint32_t)irq7, 0x08, 0x8E);
-    idt_set_gate(40, (uint32_t)irq8, 0x08, 0x8E);
-    idt_set_gate(41, (uint32_t)irq9, 0x08, 0x8E);
-    idt_set_gate(42, (uint32_t)irq10, 0x08, 0x8E);
-    idt_set_gate(43, (uint32_t)irq11, 0x08, 0x8E);
-    idt_set_gate(44, (uint32_t)irq12, 0x08, 0x8E);
-    idt_set_gate(45, (uint32_t)irq13, 0x08, 0x8E);
-    idt_set_gate(46, (uint32_t)irq14, 0x08, 0x8E);
-    idt_set_gate(47, (uint32_t)irq15, 0x08, 0x8E);
+    idt_set_gate(32, (uint64_t)irq0, 0x08, 0x8E);
+    idt_set_gate(33, (uint64_t)irq1, 0x08, 0x8E);
+    idt_set_gate(34, (uint64_t)irq2, 0x08, 0x8E);
+    idt_set_gate(35, (uint64_t)irq3, 0x08, 0x8E);
+    idt_set_gate(36, (uint64_t)irq4, 0x08, 0x8E);
+    idt_set_gate(37, (uint64_t)irq5, 0x08, 0x8E);
+    idt_set_gate(38, (uint64_t)irq6, 0x08, 0x8E);
+    idt_set_gate(39, (uint64_t)irq7, 0x08, 0x8E);
+    idt_set_gate(40, (uint64_t)irq8, 0x08, 0x8E);
+    idt_set_gate(41, (uint64_t)irq9, 0x08, 0x8E);
+    idt_set_gate(42, (uint64_t)irq10, 0x08, 0x8E);
+    idt_set_gate(43, (uint64_t)irq11, 0x08, 0x8E);
+    idt_set_gate(44, (uint64_t)irq12, 0x08, 0x8E);
+    idt_set_gate(45, (uint64_t)irq13, 0x08, 0x8E);
+    idt_set_gate(46, (uint64_t)irq14, 0x08, 0x8E);
+    idt_set_gate(47, (uint64_t)irq15, 0x08, 0x8E);
     
     // Syscall
-    idt_set_gate(128, (uint32_t)isr128, 0x08, 0xEE);
+    idt_set_gate(128, (uint64_t)isr128, 0x08, 0xEE);
 
     __asm__ __volatile__("lidt %0" : : "m"(ip));
 }
@@ -608,6 +590,17 @@ void put_pixel(FrameBuffer* fb, int32_t x, int32_t y, uint32_t color) {
     } else if (fb->bitsPerPixel == 32) {
         *(uint32_t*)pixel = color;
     }
+}
+
+uint32_t get_pixel(FrameBuffer* fb, int32_t x, int32_t y) {
+    if (x < 0 || x >= (int32_t)fb->width || y < 0 || y >= (int32_t)fb->height) return 0;
+    uint8_t* pixel = (uint8_t*)fb->address + y * fb->pitch + x * fb->bytesPerPixel;
+    if (fb->bitsPerPixel == 24) {
+        return pixel[0] | (pixel[1] << 8) | (pixel[2] << 16);
+    } else if (fb->bitsPerPixel == 32) {
+        return *(uint32_t*)pixel;
+    }
+    return 0;
 }
 
 void clear_screen(FrameBuffer* fb, uint32_t color) {
@@ -711,6 +704,29 @@ void draw_string(FrameBuffer* fb, Font* font, const char* str, int32_t x, int32_
         x += font->char_width;
         str++;
     }
+}
+
+static void* g_vram_address = NULL;
+
+void init_back_buffer(FrameBuffer* fb) {
+    if (g_vram_address != NULL) return;
+    
+    size_t buffer_size = fb->pitch * fb->height;
+    void* back_buffer = kmalloc(buffer_size);
+    
+    if (back_buffer) {
+        g_vram_address = fb->address;
+        fb->address = back_buffer;
+        memcpy(back_buffer, g_vram_address, buffer_size);
+    }
+}
+
+void swap_buffers(FrameBuffer* fb) {
+    if (!g_vram_address) return;
+    uint32_t* dest = (uint32_t*)g_vram_address;
+    uint32_t* src = (uint32_t*)fb->address;
+    size_t count = (fb->pitch * fb->height) / 4;
+    while (count--) *dest++ = *src++;
 }
 
 // ==========================================
@@ -820,168 +836,310 @@ void vga_print_dec(uint32_t n) {
 // ==========================================
 // FILE: pmm.c
 // ==========================================
-#define MAX_ORDER 10
-#define KERNEL_RESERVED_END 0x200000U
-static page_frame_t* page_frame_database = NULL;
-static page_frame_t* free_lists[MAX_ORDER + 1];
+#define PAGE_SIZE 4096
+#define MAX_ORDER 11        // Orders 0..10 (4KB to 4MB)
+
+// --- Memory Management Structures ---
+
+// Physical Page Descriptor
+typedef struct Page {
+    uint8_t flags;       // 0=Free, 1=Used
+    uint8_t order;       // Order of the block (valid if head of free block)
+    struct Page *next;   // For free lists
+    struct Page *prev;   // For free lists
+} Page;
+
+// Free List for Buddy System
+typedef struct {
+    Page *head;
+} FreeList;
+
+// SLAB Cache Structures
+typedef struct Slab {
+    void *objects;       // Pointer to the actual memory page(s)
+    uint32_t inuse;      // Count of active objects
+    uint32_t free_idx;   // Index of the next free object
+    struct Slab *next;
+    // Note: A free-list array usually follows this struct in memory
+} Slab;
+
+typedef struct Cache {
+    uint32_t obj_size;
+    uint32_t obj_per_slab;
+    uint32_t slab_order; // Pages required per slab (2^order)
+    Slab *slabs_partial;
+    Slab *slabs_full;
+    Slab *slabs_free;
+} Cache;
+
+// --- Globals ---
+uintptr_t memblock_cursor;  // Early allocator pointer
+Page *mem_map;              // Array of all physical pages
 static uint32_t total_pages = 0;
+FreeList free_areas[MAX_ORDER];
 
-static inline uint32_t idx_from_addr(void* addr) {
-    return (uint32_t)((uintptr_t)addr / PAGE_SIZE);
-}
-static inline void* addr_from_idx(uint32_t idx) {
-    return (void*)((uintptr_t)idx * PAGE_SIZE);
-}
-static inline uint32_t get_buddy_index(uint32_t index, uint32_t order) {
-    return index ^ (1u << order);
+// --- Helper Functions ---
+
+uintptr_t align_up(uintptr_t addr, uintptr_t align) {
+    return (addr + align - 1) & ~(align - 1);
 }
 
-void pmm_init(uint32_t memory_end_bytes) {
-    total_pages = memory_end_bytes / PAGE_SIZE;
-    size_t db_size = total_pages * sizeof(page_frame_t);
-    uint32_t db_pages = (db_size + PAGE_SIZE - 1) / PAGE_SIZE;
+// --- 1. Memblock Early Allocator ---
 
-    uint32_t reserved_pages = (KERNEL_RESERVED_END / PAGE_SIZE) + db_pages;
-    if (reserved_pages >= total_pages) return;
-    
-    page_frame_database = (page_frame_t*)(uintptr_t)KERNEL_RESERVED_END;
-    uint32_t usable_start = reserved_pages;
-    
-    for (uint32_t i = 0; i < total_pages; ++i) {
-        page_frame_database[i].state = PAGE_STATE_FREE;
-        page_frame_database[i].order = 0;
-        page_frame_database[i].next = NULL;
-        page_frame_database[i].prev = NULL;
-    }
-    for (uint32_t i = 0; i < reserved_pages; ++i) {
-        page_frame_database[i].state = PAGE_STATE_RESERVED;
-    }
-    for (int i = 0; i <= MAX_ORDER; ++i) free_lists[i] = NULL;
-    
-    uint32_t current = usable_start;
-    while (current < total_pages) {
-        int order = MAX_ORDER;
-        while (order >= 0) {
-            uint32_t block_size = 1u << order;
-            if ((current % block_size) == 0 && (current + block_size) <= total_pages) break;
-            --order;
+void memblock_init() {
+    memblock_cursor = align_up((uintptr_t)kernel_end, PAGE_SIZE);
+}
+
+void* memblock_alloc(size_t size) {
+    uintptr_t ptr = memblock_cursor;
+    memblock_cursor = align_up(memblock_cursor + size, 4); // 4-byte align
+    return (void*)ptr;
+}
+
+// --- 2. Buddy Allocator ---
+
+Page* phys_to_page(uintptr_t phys) {
+    uint32_t pfn = phys / PAGE_SIZE;
+    if (pfn >= total_pages) return NULL;
+    return &mem_map[pfn];
+}
+
+uintptr_t page_to_phys(Page* page) {
+    return (page - mem_map) * PAGE_SIZE;
+}
+
+void list_add(Page** head, Page* node) {
+    node->next = *head;
+    node->prev = NULL;
+    if (*head) (*head)->prev = node;
+    *head = node;
+}
+
+void list_remove(Page** head, Page* node) {
+    if (node->prev) node->prev->next = node->next;
+    else *head = node->next;
+    if (node->next) node->next->prev = node->prev;
+    node->next = node->prev = NULL;
+}
+
+Page* alloc_pages(int order) {
+    for (int current_order = order; current_order < MAX_ORDER; current_order++) {
+        if (free_areas[current_order].head) {
+            Page* page = free_areas[current_order].head;
+            list_remove(&free_areas[current_order].head, page);
+            page->flags = 1; // Mark used
+
+            // Split down to requested order
+            while (current_order > order) {
+                current_order--;
+                Page* buddy = page + (1 << current_order);
+                buddy->flags = 0;
+                buddy->order = current_order;
+                list_add(&free_areas[current_order].head, buddy);
+            }
+            page->order = order;
+            return page;
         }
-        if (order < 0) order = 0;
-        
-        page_frame_t* f = &page_frame_database[current];
-        f->order = (uint8_t)order;
-        f->state = PAGE_STATE_FREE;
-        f->prev = NULL;
-        f->next = free_lists[order];
-        if (free_lists[order]) free_lists[order]->prev = f;
-        free_lists[order] = f;
+    }
+    return NULL; // OOM
+}
 
-        current += (1u << order);
+void free_pages(Page* page, int order) {
+    uint32_t pfn = page - mem_map;
+    page->flags = 0;
+
+    // Automatic Buddy Merging
+    while (order < MAX_ORDER - 1) {
+        uint32_t buddy_pfn = pfn ^ (1 << order);
+        Page* buddy = &mem_map[buddy_pfn];
+
+        if (buddy_pfn >= total_pages || buddy->flags == 1 || buddy->order != order) {
+            break; // Cannot merge
+        }
+
+        // Remove buddy from free list
+        list_remove(&free_areas[order].head, buddy);
+        
+        // Combine
+        if (buddy_pfn < pfn) {
+            page = buddy;
+            pfn = buddy_pfn;
+        }
+        order++;
+    }
+
+    page->order = order;
+    list_add(&free_areas[order].head, page);
+}
+
+void mm_init(struct boot_params* params) {
+    memblock_init();
+
+    // 1. Calculate max RAM
+    uint64_t max_ram = 0;
+    for (int i = 0; i < params->e820_entries; i++) {
+        struct e820entry* e = &params->e820_map[i];
+        if (e->type == 1 && (e->addr + e->size) > max_ram) {
+            max_ram = e->addr + e->size;
+        }
+    }
+    total_pages = max_ram / PAGE_SIZE;
+
+    // 2. Allocate Mem Map (using Memblock)
+    size_t map_size = total_pages * sizeof(Page);
+    mem_map = memblock_alloc(map_size);
+    memset(mem_map, 0, map_size);
+
+    // 3. Initialize all pages as USED initially
+    for (uint32_t i = 0; i < total_pages; i++) {
+        mem_map[i].flags = 1; 
+    }
+
+    // 4. Free usable regions into Buddy System
+    // We only free memory ABOVE the end of our early allocations
+    uintptr_t free_start = align_up(memblock_cursor, PAGE_SIZE);
+
+    for (int i = 0; i < params->e820_entries; i++) {
+        struct e820entry* e = &params->e820_map[i];
+        if (e->type == 1) {
+            uint64_t start = e->addr;
+            uint64_t end = start + e->size;
+
+            // Adjust start to avoid kernel/memblock
+            if (start < free_start) start = free_start;
+            
+            if (start >= end) continue;
+
+            // Free pages in this range
+            for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
+                // Ensure we don't go out of bounds
+                if (addr / PAGE_SIZE >= total_pages) break;
+                
+                Page* p = phys_to_page(addr);
+                // We force flags=1 before freeing so free_pages logic works
+                p->flags = 1; 
+                free_pages(p, 0);
+            }
+        }
     }
 }
+
+// --- 3. SLAB Allocator ---
+
+Cache kmem_cache_create(size_t obj_size) {
+    Cache c;
+    c.obj_size = align_up(obj_size, 4);
+    c.slab_order = 0;
+    
+    // Calculate objects per slab (using 1 page for simplicity)
+    // Layout: [Slab Header] [Free Index Array] [Objects...]
+    size_t overhead = sizeof(Slab);
+    size_t space = PAGE_SIZE - overhead;
+    c.obj_per_slab = space / (c.obj_size + 2); // +2 for uint16_t index
+    
+    c.slabs_full = c.slabs_partial = c.slabs_free = NULL;
+    return c;
+}
+
+void* kmem_cache_alloc(Cache* cache) {
+    Slab* slab = cache->slabs_partial;
+    
+    if (!slab) {
+        // No partial slabs, check free slabs or allocate new
+        if (cache->slabs_free) {
+            slab = cache->slabs_free;
+            list_remove((Page**)&cache->slabs_free, (Page*)slab); // Cast hack for list util
+        } else {
+            // Allocate new page from Buddy
+            Page* p = alloc_pages(0); // Order 0
+            if (!p) return NULL;
+            
+            slab = (Slab*)page_to_phys(p);
+            slab->objects = (void*)((uintptr_t)slab + sizeof(Slab) + cache->obj_per_slab * 2);
+            slab->inuse = 0;
+            slab->free_idx = 0;
+            slab->next = NULL;
+            
+            // Init free indices
+            uint16_t* indices = (uint16_t*)((uintptr_t)slab + sizeof(Slab));
+            for (uint32_t i = 0; i < cache->obj_per_slab - 1; i++) indices[i] = i + 1;
+            indices[cache->obj_per_slab - 1] = 0xFFFF; // End marker
+        }
+        // Add to partial list
+        slab->next = cache->slabs_partial;
+        cache->slabs_partial = slab;
+    }
+
+    // Allocate object
+    uint16_t* indices = (uint16_t*)((uintptr_t)slab + sizeof(Slab));
+    uint32_t idx = slab->free_idx;
+    slab->free_idx = indices[idx];
+    slab->inuse++;
+
+    if (slab->free_idx == 0xFFFF) {
+        // Move to full list
+        cache->slabs_partial = slab->next;
+        slab->next = cache->slabs_full;
+        cache->slabs_full = slab;
+    }
+
+    return (void*)((uintptr_t)slab->objects + idx * cache->obj_size);
+}
+
+void kmem_cache_free(Cache* cache, void* obj) {
+    if (!obj) return;
+
+    // 1. Find the Slab Header
+    // Since slabs are 4KB aligned (PAGE_SIZE) and the header is at the start,
+    // we can mask the address to find the page start.
+    uintptr_t page_addr = (uintptr_t)obj & ~(PAGE_SIZE - 1);
+    Slab* slab = (Slab*)page_addr;
+
+    // 2. Calculate the object index
+    // We need to know where the objects start relative to the page
+    uintptr_t objects_start = (uintptr_t)slab->objects;
+    uintptr_t obj_addr = (uintptr_t)obj;
+    
+    // Calculate index: (Address - Start) / Size
+    uint32_t idx = (obj_addr - objects_start) / cache->obj_size;
+
+    // 3. Push index back onto the Free Index Array (LIFO)
+    uint16_t* indices = (uint16_t*)((uintptr_t)slab + sizeof(Slab));
+    indices[idx] = slab->free_idx; // Point this slot to the previous head
+    slab->free_idx = idx;          // Make this slot the new head
+    slab->inuse--;
+}
+
+// --- PMM Adapter Functions (For compatibility with existing kernel code) ---
 
 void* pmm_alloc_page(void) {
-    for (int order = 0; order <= MAX_ORDER; ++order) {
-        if (!free_lists[order]) continue;
-        page_frame_t* block = free_lists[order];
-        free_lists[order] = block->next;
-        if (free_lists[order]) free_lists[order]->prev = NULL;
-        
-        int cur_order = order;
-        uint32_t base_idx = (uint32_t)(block - page_frame_database);
-        while (cur_order > 0) {
-            cur_order--;
-            uint32_t buddy_idx = base_idx + (1u << cur_order);
-            page_frame_t* buddy = &page_frame_database[buddy_idx];
-            buddy->order = (uint8_t)cur_order;
-            buddy->state = PAGE_STATE_FREE;
-            buddy->next = free_lists[cur_order];
-            if (free_lists[cur_order]) free_lists[cur_order]->prev = buddy;
-            buddy->prev = NULL;
-            free_lists[cur_order] = buddy;
-        }
-
-        block->order = 0;
-        block->state = PAGE_STATE_USED;
-        block->next = block->prev = NULL;
-        uint32_t idx = (uint32_t)(block - page_frame_database);
-        return addr_from_idx(idx);
-    }
-    return NULL;
+    Page* p = alloc_pages(0);
+    if (!p) return NULL;
+    return (void*)page_to_phys(p);
 }
 
 void* pmm_alloc_pages(uint32_t count) {
+    // Calculate order needed
     int order = 0;
     while ((1u << order) < count) order++;
-    if (order > MAX_ORDER) return NULL;
-
-    for (int i = order; i <= MAX_ORDER; ++i) {
-        if (!free_lists[i]) continue;
-        page_frame_t* block = free_lists[i];
-        free_lists[i] = block->next;
-        if (free_lists[i]) free_lists[i]->prev = NULL;
-
-        while (i > order) {
-            i--;
-            uint32_t base_idx = (uint32_t)(block - page_frame_database);
-            uint32_t buddy_idx = base_idx + (1u << i);
-            page_frame_t* buddy = &page_frame_database[buddy_idx];
-            buddy->order = (uint8_t)i;
-            buddy->state = PAGE_STATE_FREE;
-            buddy->next = free_lists[i];
-            if (free_lists[i]) free_lists[i]->prev = buddy;
-            buddy->prev = NULL;
-            free_lists[i] = buddy;
-        }
-        block->order = (uint8_t)order;
-        block->state = PAGE_STATE_USED;
-        return addr_from_idx((uint32_t)(block - page_frame_database));
-    }
-    return NULL;
+    
+    Page* p = alloc_pages(order);
+    if (!p) return NULL;
+    return (void*)page_to_phys(p);
 }
 
 void pmm_free_page(void* p) {
     if (!p) return;
-    uintptr_t addr = (uintptr_t)p;
-    if (addr % PAGE_SIZE) return; 
-
-    uint32_t idx = (uint32_t)(addr / PAGE_SIZE);
-    if (idx >= total_pages) return;
-
-    page_frame_t* frame = &page_frame_database[idx];
-    if (frame->state == PAGE_STATE_RESERVED) return;
-
-    frame->state = PAGE_STATE_FREE;
-    frame->order = 0;
-
-    for (int order = 0; order < MAX_ORDER; ++order) {
-        uint32_t buddy_idx = get_buddy_index(idx, order);
-        if (buddy_idx >= total_pages) break;
-        page_frame_t* buddy = &page_frame_database[buddy_idx];
-
-        if (buddy->state != PAGE_STATE_FREE || buddy->order != order) break;
-        
-        if (buddy->prev) buddy->prev->next = buddy->next;
-        else free_lists[order] = buddy->next;
-        if (buddy->next) buddy->next->prev = buddy->prev;
-        
-        if (buddy_idx < idx) idx = buddy_idx;
-        frame = &page_frame_database[idx];
-        frame->order = (uint8_t)(order + 1);
-        frame->state = PAGE_STATE_FREE;
-    }
-    int final_order = frame->order;
-    frame->next = free_lists[final_order];
-    if (free_lists[final_order]) free_lists[final_order]->prev = frame;
-    frame->prev = NULL;
-    free_lists[final_order] = frame;
+    Page* page = phys_to_page((uintptr_t)p);
+    if (page) free_pages(page, 0);
 }
 
 uint32_t pmm_get_free_memory(void) {
+    // Calculate free memory from free lists
     uint32_t total_free = 0;
-    for (int order = 0; order <= MAX_ORDER; ++order) {
+    for (int order = 0; order < MAX_ORDER; ++order) {
         uint32_t block_pages = (1u << order);
-        page_frame_t* cur = free_lists[order];
+        Page* cur = free_areas[order].head;
         while (cur) {
             total_free += block_pages * PAGE_SIZE;
             cur = cur->next;
@@ -1013,9 +1171,9 @@ static inline size_t align(size_t size) {
     return (size + HEAP_ALIGNMENT - 1) & ~(HEAP_ALIGNMENT - 1);
 }
 
-void heap_init(uint32_t start_address, uint32_t size){
+void heap_init(uintptr_t start_address, uint32_t size){
     if (size < sizeof(heap_header_t) + HEAP_ALIGNMENT) return;
-    heap_start_address = (void*)start_address;
+    heap_start_address = (void*)((uintptr_t)start_address);
     heap_size = size;
     first_segment = (heap_header_t*)heap_start_address;
     spinlock_init(&heap_lock);
@@ -1090,80 +1248,112 @@ void heap_free(void* ptr){
 void* kmalloc(size_t size) { return heap_alloc(size); }
 void kfree(void* ptr) { heap_free(ptr); }
 
+// Wrappers for Standard Library compatibility
+void* malloc(size_t size) { return kmalloc(size); }
+void free(void* ptr) { kfree(ptr); }
+
 // ==========================================
 // FILE: paging.c
 // ==========================================
-page_directory_t* page_directory = 0;
+#define PTE_PRESENT 1
+#define PTE_RW      2
+#define PTE_USER    4
 
-void paging_map(uint32_t phys, uint32_t virt, uint32_t flags) {
-    (void)flags;
-    uint32_t pd_index = virt >> 22;
-    uint32_t pt_index = (virt >> 12) & 0x03FF;
+typedef struct {
+    uint64_t entries[512];
+} pt_t;
 
-    if (!page_directory->tables[pd_index]) {
-        page_table_t* new_table = (page_table_t*)pmm_alloc_page();
-        memset(new_table, 0, sizeof(page_table_t));
-        page_directory->tables[pd_index] = new_table;
-        page_directory->physical_tables[pd_index] = ((uint32_t)new_table) | 0x7;
+pt_t* kernel_pml4 = NULL;
+
+void paging_map(uint64_t phys, uint64_t virt, uint64_t flags) {
+    if (!kernel_pml4) return;
+
+    uint64_t pml4_idx = (virt >> 39) & 0x1FF;
+    uint64_t pdpt_idx = (virt >> 30) & 0x1FF;
+    uint64_t pd_idx   = (virt >> 21) & 0x1FF;
+    uint64_t pt_idx   = (virt >> 12) & 0x1FF;
+
+    if (!(kernel_pml4->entries[pml4_idx] & PTE_PRESENT)) {
+        pt_t* new_pdpt = (pt_t*)pmm_alloc_page();
+        memset(new_pdpt, 0, PAGE_SIZE);
+        kernel_pml4->entries[pml4_idx] = (uint64_t)new_pdpt | PTE_PRESENT | PTE_RW | PTE_USER;
     }
+    pt_t* pdpt = (pt_t*)(kernel_pml4->entries[pml4_idx] & ~0xFFF);
 
-    page_table_t* table = page_directory->tables[pd_index];
-    table->pages[pt_index].frame = phys >> 12;
-    table->pages[pt_index].present = 1;
-    table->pages[pt_index].rw = 1;
-    table->pages[pt_index].user = 1;
+    if (!(pdpt->entries[pdpt_idx] & PTE_PRESENT)) {
+        pt_t* new_pd = (pt_t*)pmm_alloc_page();
+        memset(new_pd, 0, PAGE_SIZE);
+        pdpt->entries[pdpt_idx] = (uint64_t)new_pd | PTE_PRESENT | PTE_RW | PTE_USER;
+    }
+    pt_t* pd = (pt_t*)(pdpt->entries[pdpt_idx] & ~0xFFF);
+
+    if (!(pd->entries[pd_idx] & PTE_PRESENT)) {
+        pt_t* new_pt = (pt_t*)pmm_alloc_page();
+        memset(new_pt, 0, PAGE_SIZE);
+        pd->entries[pd_idx] = (uint64_t)new_pt | PTE_PRESENT | PTE_RW | PTE_USER;
+    }
+    pt_t* pt = (pt_t*)(pd->entries[pd_idx] & ~0xFFF);
+
+    pt->entries[pt_idx] = phys | flags;
 }
 
-void switch_page_directory(page_directory_t *dir) {
-    uint32_t cr0;
-    asm volatile("mov %0, %%cr3" :: "r"(&dir->physical_tables));
-    asm volatile("mov %%cr0, %0" : "=r"(cr0));
-    cr0 |= 0x80000000;
-    asm volatile("mov %0, %%cr0" :: "r"(cr0));
-}
-
-void page_fault_handler(registers_t *r) {
+registers_t* page_fault_handler(registers_t *r) {
     (void)r;
-    uint32_t faulting_address;
+    uint64_t faulting_address;
     __asm__ __volatile__("mov %%cr2, %0" : "=r" (faulting_address));
     
     console_write("\n[CRITICAL] PAGE FAULT at 0x");
-    console_write_dec(faulting_address);
+    console_write_dec((uint32_t)faulting_address);
     console_write("\nSystem Halted.\n");
     __asm__ __volatile__("cli");
     for(;;) { __asm__ __volatile__("hlt"); }
+    return r;
 }
 
 void paging_install(void) {
-    page_directory = (page_directory_t*)pmm_alloc_page();
-    memset(page_directory, 0, sizeof(page_directory_t));
+    kernel_pml4 = (pt_t*)pmm_alloc_page();
+    memset(kernel_pml4, 0, PAGE_SIZE);
 
     // Map Kernel (0-4MB)
-    for (uint32_t i = 0; i < 0x400000; i += PAGE_SIZE) {
-        paging_map(i, i, 0x3);
+    for (uint64_t i = 0; i < 0x400000; i += PAGE_SIZE) {
+        paging_map(i, i, PTE_PRESENT | PTE_RW);
     }
     // Map Heap (4MB-20MB)
-    for (uint32_t i = 0x00400000; i < 0x01400000; i += PAGE_SIZE) {
-        paging_map(i, i, 0x3);
+    for (uint64_t i = 0x00400000; i < 0x01400000; i += PAGE_SIZE) {
+        paging_map(i, i, PTE_PRESENT | PTE_RW);
     }
     // Map Framebuffer
-    uint32_t fb_phys = vbe_mode_info.physbase;
+    uint64_t fb_phys = screen_info.physbase;
     if (fb_phys != 0) {
-        for (uint32_t i = 0; i < 0x00800000; i += PAGE_SIZE) {
-            paging_map(fb_phys + i, fb_phys + i, 0x3);
+        for (uint64_t i = 0; i < 0x00800000; i += PAGE_SIZE) {
+            paging_map(fb_phys + i, fb_phys + i, PTE_PRESENT | PTE_RW);
         }
     }
     register_interrupt_handler(14, page_fault_handler);
-    switch_page_directory(page_directory);
+    
+    __asm__ __volatile__("mov %0, %%cr3" :: "r"(kernel_pml4));
 }
 
 // ==========================================
 // FILE: timer.c
 // ==========================================
 volatile uint32_t ticks = 0;
-void timer_handler(registers_t *r) {
+extern task_t* ready_queue; // Forward declare from task.c section
+registers_t* timer_handler(registers_t *r) {
     ticks++;
-    schedule(r);
+
+    // Wake up sleeping tasks
+    if (ready_queue) {
+        task_t* current = ready_queue;
+        do {
+            if (current->state == TASK_SLEEPING && ticks >= current->wake_at_tick) {
+                current->state = TASK_READY;
+            }
+            current = current->next;
+        } while (current != ready_queue);
+    }
+
+    return schedule(r);
 }
 uint32_t get_ticks() {
     return ticks;
@@ -1205,10 +1395,10 @@ static char key_buffer[256];
 static int buffer_start = 0;
 static int buffer_end = 0;
 
-void keyboard_handler(registers_t *r) {
+registers_t* keyboard_handler(registers_t *r) {
     (void)r;
     unsigned char scancode = inb(KEYBOARD_DATA_PORT);
-    if (scancode > 127) return;
+    if (scancode > 127) return r;
     
     if (scancode & 0x80) {
         scancode &= 0x7F;
@@ -1236,6 +1426,7 @@ void keyboard_handler(registers_t *r) {
             }
         }
     }
+    return r;
 }
 
 char keyboard_getchar(void) {
@@ -1276,7 +1467,7 @@ volatile int32_t mouse_x = 400;
 volatile int32_t mouse_y = 300;
 volatile uint8_t mouse_buttons = 0;
 mouse_packet_t mouse_packet;
-static void mouse_handler(registers_t *regs);
+static registers_t* mouse_handler(registers_t *regs);
 
 void mouse_install(void) {
     outb(MOUSE_COMMAND_PORT, 0xA8);
@@ -1294,7 +1485,7 @@ void mouse_install(void) {
     irq_install_handler(MOUSE_IRQ, mouse_handler);
 }
 
-static void mouse_handler(registers_t *regs) {
+static registers_t* mouse_handler(registers_t *regs) {
     (void)regs;
     static uint8_t packet_byte_index = 0;
     static mouse_packet_t packet;
@@ -1315,6 +1506,7 @@ static void mouse_handler(registers_t *regs) {
             packet_byte_index = 0;
         }
     }
+    return regs;
 }
 
 // ==========================================
@@ -1366,7 +1558,7 @@ void pci_scan(void) {
 uint32_t rtl8139_io_base = 0;
 uint8_t* rx_buffer;
 
-void rtl8139_handler(registers_t *r) {
+registers_t* rtl8139_handler(registers_t *r) {
     (void)r;
     vga_print_string("[NIC IRQ]");
     uint16_t status = inw(rtl8139_io_base + REG_ISR);
@@ -1374,6 +1566,7 @@ void rtl8139_handler(registers_t *r) {
         vga_print_string(" Packet Received ");
     }
     outw(rtl8139_io_base + REG_ISR, status);
+    return r;
 }
 
 void rtl8139_init(void) {
@@ -1401,7 +1594,7 @@ void rtl8139_init(void) {
     outb(rtl8139_io_base + REG_COMMAND, 0x10);
     while((inb(rtl8139_io_base + REG_COMMAND) & 0x10) != 0) { /* wait */ }
     rx_buffer = (uint8_t*)pmm_alloc_pages(4);
-    outl(rtl8139_io_base + REG_RX_BUF, (uint32_t)rx_buffer);
+    outl(rtl8139_io_base + REG_RX_BUF, (uintptr_t)rx_buffer);
     outw(rtl8139_io_base + REG_IMR, 0x0005);
     outl(rtl8139_io_base + REG_RCR, 0x0F);
     outb(rtl8139_io_base + REG_COMMAND, 0x0C);
@@ -1435,13 +1628,15 @@ void cursor_draw(FrameBuffer* fb, int x, int y) {
             int fb_x = x + cx;
             int fb_y = y + cy;
             if (fb_x < 0 || fb_x >=(int)fb->width || fb_y < 0 || fb_y >= (int)fb->height) continue;
-            uint32_t* fb_pixel = (uint32_t*)((uint8_t*)fb->address + (fb_y * fb->pitch) + (fb_x * (fb->bitsPerPixel / 8)));
+            
+            uint32_t bg_color = get_pixel(fb, fb_x, fb_y);
+
             if (cursor_bitmap[cy][byte_index] & mask) {
-                cursor_fg_buffer[cy * CURSOR_WIDTH + cx] = *fb_pixel;
-                *fb_pixel = 0xFFFFFFFF; 
+                cursor_fg_buffer[cy * CURSOR_WIDTH + cx] = bg_color;
+                put_pixel(fb, fb_x, fb_y, 0xFFFFFF);
             } else {
-                cursor_bg_buffer[cy * CURSOR_WIDTH + cx] = *fb_pixel;
-                *fb_pixel = 0x00000000; 
+                cursor_bg_buffer[cy * CURSOR_WIDTH + cx] = bg_color;
+                put_pixel(fb, fb_x, fb_y, 0x000000);
             }
         }
     }
@@ -1455,12 +1650,14 @@ void cursor_update(FrameBuffer* fb, int x, int y) {
                 int fb_x = prev_x + cx;
                 int fb_y = prev_y + cy;
                 if (fb_x < 0 || fb_x >= (int)fb->width || fb_y < 0 || fb_y >= (int)fb->height) continue;
-                uint32_t* fb_pixel = (uint32_t*)((uint8_t*)fb->address + (fb_y * fb->pitch) + (fb_x * (fb->bitsPerPixel / 8)));
+                
+                uint32_t saved_color;
                 if (cursor_bitmap[cy][cx / 8] & (1 << (7 - (cx % 8)))) {
-                    *fb_pixel = cursor_fg_buffer[cy * CURSOR_WIDTH + cx];
+                    saved_color = cursor_fg_buffer[cy * CURSOR_WIDTH + cx];
                 } else {
-                    *fb_pixel = cursor_bg_buffer[cy * CURSOR_WIDTH + cx];
+                    saved_color = cursor_bg_buffer[cy * CURSOR_WIDTH + cx];
                 }
+                put_pixel(fb, fb_x, fb_y, saved_color);
             }
         }
     }
@@ -1521,8 +1718,9 @@ const Rect* dirty_rect_get_all(int* count) {
 // ==========================================
 // FILE: console.c
 // ==========================================
-static FrameBuffer* console_fb = NULL;
-static Font* console_font = NULL;
+FrameBuffer* console_fb = NULL;
+Font* console_font = NULL;
+
 void console_init(FrameBuffer* fb, Font* font) {
     console_fb = fb;
     console_font = font;
@@ -1562,7 +1760,7 @@ void syscalls_install(void){
 	vga_print_string("Syscall Interface Installed, Simple OS WORKING\n");
 }
 void syscall_handler(registers_t *r){
-	if (r->eax==0){
+	if (r->rax==0){
 		vga_print_string("SYSTEM CALL RECEIVED!, SIMPLE OS WORKING\n");
 	}
 }
@@ -1570,8 +1768,8 @@ void syscall_handler(registers_t *r){
 // ==========================================
 // FILE: task.c
 // ==========================================
-static task_t* current_task;
-static task_t* ready_queue;
+task_t* current_task = NULL;
+task_t* ready_queue = NULL;
 static int next_pid = 1;
 
 void idle_task_func(void){
@@ -1602,15 +1800,12 @@ void create_task(char* name, void (*entry_point)(void)) {
 
     new_task->id = next_pid++;
     new_task->state = TASK_READY;
-    new_task->kernel_stack = (void*)((uint32_t)pmm_alloc_page() + PAGE_SIZE);
-    uint32_t stack_top = (uint32_t)new_task->kernel_stack;
-    registers_t* initial_regs = (registers_t*)(stack_top - sizeof(registers_t));
-    memset(initial_regs, 0, sizeof(registers_t));
-    initial_regs->eip = (uint32_t)entry_point;
-    initial_regs->eflags = 0x202; 
-    new_task->regs.esp = (uint32_t)initial_regs;
-    initial_regs->cs = 0x08; 
-    initial_regs->ds = 0x10; 
+    new_task->kernel_stack = (void*)((uintptr_t)pmm_alloc_page() + PAGE_SIZE);
+    new_task->regs.rip = (uint64_t)entry_point;
+    new_task->regs.cs = 0x08;
+    new_task->regs.rflags = 0x202;
+    new_task->regs.rsp = (uint64_t)new_task->kernel_stack;
+    new_task->regs.ss = 0x10;
     
     task_t* temp = ready_queue;
     while (temp->next != NULL) temp = temp->next;
@@ -1619,8 +1814,10 @@ void create_task(char* name, void (*entry_point)(void)) {
     __asm__ __volatile__("sti");
 }
 
-void schedule(registers_t* r) {
-    if (!current_task) return;
+registers_t* schedule(registers_t* r) {
+    if (!current_task) return r;
+
+    // Save current task's context
     current_task->regs = *r;
     task_t* next_task = current_task->next;
     while (next_task && next_task->state != TASK_READY) {
@@ -1630,9 +1827,27 @@ void schedule(registers_t* r) {
             break;
         }
     }
+
+    // If the task was running, it's now ready to be scheduled again, unless it's sleeping/blocked
+    if (current_task->state == TASK_RUNNING) {
+        current_task->state = TASK_READY;
+    }
     current_task = next_task;
+
+    // Find the next ready task to run in the circular list
+    task_t* next = current_task;
+    do {
+        next = next->next;
+    } while (next->state != TASK_READY);
+    // This simple loop works because the main kernel task (acting as idle) never sleeps,
+    // so there is always at least one ready task in the queue.
+
+    // Switch to the next task
+    current_task = next;
     current_task->state = TASK_RUNNING;
-    *r = current_task->regs;
+
+    // Load next task's context
+    return &current_task->regs;
 }
 
 void schedule_and_release_lock(spinlock_t* lock, unsigned long flags) {
@@ -1640,10 +1855,27 @@ void schedule_and_release_lock(spinlock_t* lock, unsigned long flags) {
     schedule_from_yield();
 }
 
+void sleep(uint32_t ms) {
+    // Timer is 100Hz, so 1 tick = 10ms.
+    uint32_t delay_ticks = ms / 10;
+    if (delay_ticks == 0 && ms > 0) {
+        delay_ticks = 1; // Sleep for at least one tick if ms > 0
+    }
+    uint32_t wake_tick = get_ticks() + delay_ticks;
+
+    task_t* task = get_current_task();
+    if (task) {
+        task->state = TASK_SLEEPING;
+        task->wake_at_tick = wake_tick;
+        schedule_from_yield(); // Force a context switch
+    }
+}
+
 // ==========================================
 // FILE: widget.c
 // ==========================================
 Font* g_widget_font=NULL;
+static Cache widget_cache;
 void widget_set_font(Font* font){ g_widget_font=font; }
 
 void draw_label(Widget* self, FrameBuffer* fb){
@@ -1756,7 +1988,7 @@ void widget_remove(Widget** head,Widget* widget){
 void widget_free(Widget* widget){
     if(!widget)return;
     if(widget->data)free(widget->data);
-    free(widget);
+    kmem_cache_free(&widget_cache, widget);
 }
 void widget_free_all(Widget** head){
     if(!head)return;
@@ -1794,7 +2026,7 @@ Widget* create_label(int x,int y,int width,int height,char* text,uint32_t color)
     if(!data)return NULL;
     data->text=text;
     data->color=color;
-    Widget* widget=(Widget*)malloc(sizeof(Widget));
+    Widget* widget=(Widget*)kmem_cache_alloc(&widget_cache);
     if(!widget){ free(data); return NULL; }
     widget->x=x; widget->y=y; widget->width=width; widget->height=height;
     widget->data=data;
@@ -1808,7 +2040,7 @@ Widget* create_button(int x,int y,int width,int height,char* text,uint32_t base_
     data->text=text; data->base_color=base_color; data->hover_color=hover_color;
     data->press_color=press_color; data->border_color=border_color; data->border_width=border_width;
     data->text_color=text_color; data->press_border=press_border; data->hover_border=hover_border;
-    Widget* widget=(Widget*)malloc(sizeof(Widget));
+    Widget* widget=(Widget*)kmem_cache_alloc(&widget_cache);
     if(!widget){ free(data); return NULL; }
     widget->x=x; widget->y=y; widget->width=width; widget->height=height;
     widget->data=data;
@@ -1823,27 +2055,25 @@ Widget* create_textbox(int x,int y,int width,int height,char* placeholder,uint32
     data->text=(char*)malloc(256); 
     if(!data->text){ free(data); return NULL; }
     data->text[0]='\0';
-    Widget* widget=(Widget*)malloc(sizeof(Widget));
+    Widget* widget=(Widget*)kmem_cache_alloc(&widget_cache);
     if(!widget){ free(data->text); free(data); return NULL; }
     widget->x=x; widget->y=y; widget->width=width; widget->height=height;
     widget->data=data; widget->draw=draw_textbox; widget->update=update_textbox;
     return widget;
 }
 
-typedef struct {
-    uint32_t bg_color; uint32_t thumb_color; int thumb_pos; int thumb_size;
-} ScrollbarData;
 Widget* create_scrollbar(int x,int y,int width,int height,uint32_t bg_color,uint32_t thumb_color){
     ScrollbarData* data=(ScrollbarData*)malloc(sizeof(ScrollbarData));
     if(!data)return NULL;
     data->bg_color=bg_color; data->thumb_color=thumb_color; data->thumb_pos=0; data->thumb_size=height/4; 
-    Widget* widget=(Widget*)malloc(sizeof(Widget));
+    Widget* widget=(Widget*)kmem_cache_alloc(&widget_cache);
     if(!widget){ free(data); return NULL; }
     widget->x=x; widget->y=y; widget->width=width; widget->height=height;
     widget->data=data; widget->draw=draw_scrollbar; widget->update=update_scrollbar;
     return widget;
 }
 void init_widget_system(){
+    widget_cache = kmem_cache_create(sizeof(Widget));
     if(!g_widget_font) vga_print_string("Failed to load widget font\n");
 }
 
@@ -2115,13 +2345,13 @@ static void shell_reboot(void) {
     uint8_t good = 0x02;
     while (good & 0x02) good = inb(0x64);
     outb(0x64, 0xFE);
-    asm volatile("hlt");
+    __asm__ __volatile__("hlt");
 }
 
 static void shell_halt(void) {
     vga_print_string("System halted. You may now turn off your computer.\n");
-    asm volatile("cli");
-    for(;;) { asm volatile("hlt"); }
+    __asm__ __volatile__("cli");
+    for(;;) { __asm__ __volatile__("hlt"); }
 }
 
 static int shell_strcmp(const char *str1, const char *str2) {
@@ -2269,20 +2499,31 @@ void on_my_button_release(Widget* self, int x, int y, int button){
     data->border_color=data->base_color;
 }
 
-void kernel_main(void) {
+void sleep_test_task() {
+    uint32_t i = 0;
+    while(1) {
+        console_write("Sleeper task running... ");
+        console_write_dec(i++);
+        console_write("\n");
+        sleep(5000); // Sleep for 5 seconds
+    }
+}
+
+void kernel_main(struct boot_params* params) __asm__("kernel_main");
+void kernel_main(struct boot_params* params) {
     gdt_install();
     idt_install();
-    pmm_init(128 * 1024 * 1024);
+    mm_init(params); // Initialize new Memory Manager
     paging_install();
     heap_init(0x00400000, 16 * 1024 * 1024); // 16 MB heap at 4 MB
-    memcpy(&vbe_mode_info, (void*)0x8000, sizeof(VbeModeInfo));
+    memcpy(&screen_info, &params->screen_info, sizeof(struct screen_info));
     FrameBuffer fb;
-    fb.address=(void*)vbe_mode_info.physbase;
-    fb.width=vbe_mode_info.resolution_x;
-    fb.height=vbe_mode_info.resolution_y;
-    fb.pitch=vbe_mode_info.pitch;
-    fb.bitsPerPixel=vbe_mode_info.bitsPerPixel;
-    fb.bytesPerPixel = vbe_mode_info.bitsPerPixel / 8;
+    fb.address=(void*)(uintptr_t)screen_info.physbase;
+    fb.width=screen_info.resolution_x;
+    fb.height=screen_info.resolution_y;
+    fb.pitch=screen_info.pitch;
+    fb.bitsPerPixel=screen_info.bitsPerPixel;
+    fb.bytesPerPixel = screen_info.bitsPerPixel / 8;
     
     Font my_font;
     my_font.char_width=8;
@@ -2301,6 +2542,8 @@ void kernel_main(void) {
     rtl8139_init();
     tasking_install();
     mouse_install();
+    create_task("counter", counter_task);
+    create_task("sleeper", sleep_test_task);
     cursor_init();
 
     uint32_t free_mem = pmm_get_free_memory();
@@ -2318,6 +2561,7 @@ void kernel_main(void) {
     window_manager_init();
     dirty_rect_init();
     widget_set_font(&my_font); 
+    init_back_buffer(&fb);
 
     // 2. Clear Screen
     clear_screen(&fb, 0xECECEC); 
@@ -2395,6 +2639,7 @@ void kernel_main(void) {
         }
 
         cursor_update(&fb, mouse_x, mouse_y);
+        swap_buffers(&fb);
         __asm__ __volatile__("hlt");
     }
-}
+} 

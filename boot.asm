@@ -97,7 +97,7 @@ init_segments:
     jne .check_failed
     cmp word [MODE_INFO_BLOCK + 20], TARGET_HEIGHT
     jne .check_failed
-    cmp word [MODE_INFO_BLOCK + 25], TARGET_BPP
+    cmp byte [MODE_INFO_BLOCK + 25], TARGET_BPP
     jne .check_failed
     
     ; FOUND IT!
@@ -126,7 +126,7 @@ init_segments:
     cmp ax, 0x004F
     jne .graphics_error
 
-    ; Save VBE info for kernel
+    ; --- 1. Boot Parameters: VBE Info ---
     ; Copy from 0x9200 (MODE_INFO_BLOCK) to 0x8000
     xor ax, ax
     mov es, ax
@@ -136,6 +136,33 @@ init_segments:
     mov ecx, 64 ; Copy 256 bytes (64 dwords)
     rep movsd   ; Use movsd for speed (32-bit width in 16-bit mode needs 0x66 prefix usually, but `rep movsd` works in real mode on 386+)
     
+    ; --- 2. Boot Parameters: RAM Condition (E820 Memory Map) ---
+    ; Store count at 0x8100, Entries at 0x8104
+    mov di, 0x8104
+    xor ebx, ebx
+    xor bp, bp              ; Entry count
+    mov edx, 0x534D4150     ; 'SMAP'
+    mov eax, 0xE820
+    mov ecx, 24
+    int 0x15
+    jc .e820_done           ; Fail or not supported
+
+.e820_loop:
+    inc bp
+    add di, 24
+    test ebx, ebx
+    jz .e820_done
+    
+    mov eax, 0xE820
+    mov ecx, 24
+    mov edx, 0x534D4150
+    int 0x15
+    jc .e820_done
+    jmp .e820_loop
+
+.e820_done:
+    mov [0x8100], bp        ; Save entry count
+
     jmp enter_pm
 
 .graphics_error:
@@ -208,6 +235,9 @@ start_protected_mode:
     mov ss, ax
     mov esp, 0x90000
     
+    ; Pass Boot Parameters (0x8000) to Kernel
+    mov ebx, 0x8000
+
     ; Copy Kernel to 1MB
     mov esi, 0x10000
     mov edi, KERNEL_TARGET_ADDR

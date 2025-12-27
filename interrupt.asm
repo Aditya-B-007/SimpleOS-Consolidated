@@ -1,3 +1,4 @@
+[bits 64]
 section .text
 global _isr0
 global _isr1
@@ -56,8 +57,8 @@ extern _irq_handler
 global _isr%1
 _isr%1:
     cli
-    push byte 0
-    push dword %1
+    push qword 0
+    push qword %1
     jmp isr_common_stub
 %endmacro
 
@@ -65,7 +66,7 @@ _isr%1:
 global _isr%1
 _isr%1:
     cli
-    push dword %1
+    push qword %1
     jmp isr_common_stub
 %endmacro
 
@@ -73,8 +74,8 @@ _isr%1:
 global _irq%1
 _irq%1:
     cli
-    push byte 0
-    push byte %2
+    push qword 0
+    push qword %2
     jmp irq_common_stub
 %endmacro
 
@@ -129,48 +130,83 @@ irq_stub 14, 46
 irq_stub 15, 47
 
 isr_common_stub:
-    pusha
-    mov ax, ds
-    push eax
+    ; Save CPU state (64-bit registers)
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
 
-    mov ax, 0x10
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-
+    ; Pass stack pointer as argument to C handler
+    mov rdi, rsp
+    
     call _isr_handler
 
-    pop eax
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
+    ; Restore CPU state
+    pop rax
+    pop rbx
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
 
-    popa
-    add esp, 8
-    sti
-    iret
+    add rsp, 16 ; Remove error code and ISR number
+    iretq
 
 irq_common_stub:
-    pusha
-    mov ax, ds
-    push eax
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
 
-    mov ax, 0x10
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-
+    mov rdi, rsp
     call _irq_handler
 
-    pop eax
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
+    pop rax
+    pop rbx
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
 
-    popa
-    add esp, 8
-    iret
+    add rsp, 16
+    iretq
