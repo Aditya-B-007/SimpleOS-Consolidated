@@ -1,232 +1,108 @@
 bits 16
 org 0x7c00
 
-; --- Memory Definitions ---
-VBE_INFO_BLOCK  equ 0x9000
-MODE_INFO_BLOCK equ 0x9200
-
-; --- Constants ---
-VBE_MAGIC equ 0x4F
-VBE_GET_INFO equ 0x00
-VBE_GET_MODE_INFO equ 0x01
-VBE_SET_MODE equ 0x02
-TARGET_WIDTH equ 1280
-TARGET_HEIGHT equ 720
-TARGET_BPP equ 32
-
-; Kernel placement
-KERNEL_TEMP_ADDR equ 0x1000 
-KERNEL_TARGET_ADDR equ 0x100000 
-SECTORS_TO_READ  equ 100
+; --- Configuration ---
+KERNEL_SEG      equ 0x1000      ; Load to 0x10000
+SECTORS_TO_READ equ 64          ; Read 32KB (Plenty for now, safe for single read)
 
 start:
-    jmp 0:init_segments
+    jmp 0:init
 
-init_segments:
+init:
+    cli
     xor ax, ax
     mov ds, ax
     mov es, ax
     mov ss, ax
     mov sp, 0x7c00
-    
-    mov [boot_drive], dl    ; Save boot drive
+    sti
 
-    ; 1. Load Kernel (Fixed Routine)
-    call load_kernel_safe
-    
-    ; CRITICAL FIX: Ensure ES is 0 for VBE calls
-    xor ax, ax
-    mov es, ax
+    mov [boot_drive], dl        ; Save Boot Drive
 
-    ; 2. Enable A20
+    ; 1. Fast A20 Gate Enable (Port 0x92)
     in al, 0x92
     or al, 2
     out 0x92, al
 
-    ; 3. VBE Graphics Setup
-    mov ax, VBE_MAGIC + VBE_GET_INFO
-    mov di, VBE_INFO_BLOCK
-    int 0x10
-    cmp ax, 0x004F
-    jne .graphics_error
-    
-    ; Get video modes list pointer
-    mov cx, [VBE_INFO_BLOCK + 14] ; Offset
-    mov si, [VBE_INFO_BLOCK + 16] ; Segment
-    mov fs, si                    ; Use FS to access the mode list segment
+    ; 2. LBA Read Kernel (Optimized: Single Block Read)
+    ; Check Extensions
+    mov ah, 0x41
+    mov bx, 0x55AA
+    mov dl, [boot_drive]
+    int 0x13
+    jc error
 
-    ; Note: The list is a far pointer (Seg:Off). 
-    ; We need to read from FS:CX (Seg:Off).
-    ; But for simplicity in Real Mode flat memory (if Seg is not 0), 
-    ; we usually normalize.
-    ; If BIOS returns a segment for the list, we must use it.
-    ; Simplification: Many BIOSes return Segment in SI.
-    
-    mov si, cx ; Move Offset to SI
-    mov ax, [VBE_INFO_BLOCK + 16] 
-    mov ds, ax ; Point DS to the VBE Mode List Segment
+    ; Read Disk
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    mov si, dap
+    int 0x13
+    jc error
 
-.mode_loop:
-    mov cx, [si]          ; Read mode number
-    cmp cx, 0xFFFF        ; End of list?
-    je .graphics_error
-    
-    push cx
-    
-    ; Restore DS to 0 for the Interrupt buffer access
-    push ds 
-    xor ax, ax
-    mov ds, ax
-    
-    mov ax, VBE_MAGIC + VBE_GET_MODE_INFO
-    mov di, MODE_INFO_BLOCK
+    ; 3. Setup VBE (Graphics)
+    mov ax, 0x4F00
+    mov di, 0x9000
     int 0x10
     
-    cmp ax, 0x004F
-    pop ds ; Restore Mode List Segment
-    jne .next_mode_pop
-
-    ; Check resolution (Need to use ES or explicit segment 0 override since DS is changed)
-    ; But wait, MODE_INFO_BLOCK is at 0x9200. We need to check it using DS=0.
-    ; It's cleaner to just switch DS back to 0 for the check.
-    push ds
-    xor ax, ax
-    mov ds, ax
-    
-    cmp word [MODE_INFO_BLOCK + 18], TARGET_WIDTH
-    jne .check_failed
-    cmp word [MODE_INFO_BLOCK + 20], TARGET_HEIGHT
-    jne .check_failed
-    cmp byte [MODE_INFO_BLOCK + 25], TARGET_BPP
-    jne .check_failed
-    
-    ; FOUND IT!
-    pop ds ; Restore stack balance (pushed DS)
-    pop cx ; Restore Mode Number (pushed CX)
-    jmp .set_mode
-
-.check_failed:
-    pop ds
-.next_mode_pop:
-    pop cx 
-    add si, 2
-    jmp .mode_loop
-
-.set_mode:
-    ; CX holds the mode number
-    mov bx, cx
-    or bx, 1 << 14 ; Linear Frame Buffer bit
-    
-    ; Reset DS to 0 before final call
-    xor ax, ax
-    mov ds, ax
-    
-    mov ax, VBE_MAGIC + VBE_SET_MODE
+    mov ax, 0x4F02
+    mov bx, 0x4118 ; 1024x768x24 Linear
     int 0x10
-    cmp ax, 0x004F
-    jne .graphics_error
-
-    ; --- 1. Boot Parameters: VBE Info ---
-    ; Copy from 0x9200 (MODE_INFO_BLOCK) to 0x8000
-    xor ax, ax
-    mov es, ax
-    mov ds, ax
-    mov edi, 0x8000
-    mov esi, MODE_INFO_BLOCK 
-    mov ecx, 64 ; Copy 256 bytes (64 dwords)
-    rep movsd   ; Use movsd for speed (32-bit width in 16-bit mode needs 0x66 prefix usually, but `rep movsd` works in real mode on 386+)
     
-    ; --- 2. Boot Parameters: RAM Condition (E820 Memory Map) ---
-    ; Store count at 0x8100, Entries at 0x8104
+    mov ax, 0x4F01
+    mov cx, 0x118
+    mov di, 0x8000
+    int 0x10
+
+    ; 4. Memory Map (E820)
     mov di, 0x8104
     xor ebx, ebx
-    xor bp, bp              ; Entry count
-    mov edx, 0x534D4150     ; 'SMAP'
+    xor bp, bp
+    mov edx, 0x534D4150
     mov eax, 0xE820
     mov ecx, 24
     int 0x15
-    jc .e820_done           ; Fail or not supported
-
-.e820_loop:
+    jc .pm_entry
+.mem_loop:
     inc bp
     add di, 24
     test ebx, ebx
-    jz .e820_done
-    
+    jz .mem_done
     mov eax, 0xE820
     mov ecx, 24
     mov edx, 0x534D4150
     int 0x15
-    jc .e820_done
-    jmp .e820_loop
+    jmp .mem_loop
+.mem_done:
+    mov [0x8100], bp
 
-.e820_done:
-    mov [0x8100], bp        ; Save entry count
-
-    jmp enter_pm
-
-.graphics_error:
-    cli
-    hlt
-
-; --- Safe Disk Loading (CHS Loop) ---
-load_kernel_safe:
-    mov ax, KERNEL_TEMP_ADDR
-    mov es, ax      ; Buffer segment
-    xor bx, bx      ; Buffer offset 0
-    
-    mov dl, [boot_drive]
-    mov ch, 0       ; Cylinder 0
-    mov dh, 0       ; Head 0
-    mov cl, 2       ; Start at Sector 2
-    
-    mov si, SECTORS_TO_READ 
-
-.read_loop:
-    mov ah, 0x02
-    mov al, 1       ; Read 1 sector at a time
-    int 0x13
-    jc .disk_error
-    
-    dec si
-    jz .done
-    
-    add bx, 512     ; Move buffer pointer
-    ; Handle Segment overflow (64KB) if necessary, but 50KB fits in one segment.
-    
-    ; Update CHS
-    inc cl          ; Next sector
-    cmp cl, 19      ; 18 sectors per track?
-    jl .read_loop
-    
-    ; Next Track/Head logic
-    mov cl, 1       ; Reset sector
-    inc dh          ; Next head
-    cmp dh, 2       ; 2 heads?
-    jl .read_loop
-    
-    mov dh, 0       ; Reset head
-    inc ch          ; Next cylinder
-    jmp .read_loop
-
-.done:
-    ret
-
-.disk_error:
-    cli
-    hlt
-
-; --- Protected Mode Entry ---
-enter_pm:
+.pm_entry:
+    ; 5. Enter Protected Mode
     cli
     lgdt [gdt_descriptor]
     mov eax, cr0
     or eax, 1
     mov cr0, eax
-    jmp 0x08:start_protected_mode
+    jmp 0x08:pm_start
 
+error:
+    mov ah, 0x0e
+    mov al, '!' ; Print '!' if error
+    int 0x10
+    cli
+    hlt
+
+; --- Data ---
+boot_drive db 0
+align 4
+dap: 
+    db 0x10, 0
+    dw SECTORS_TO_READ
+    dw 0x0000, KERNEL_SEG
+    dd 1, 0  ; LBA Low, LBA High
+
+; --- 32-bit Protected Mode ---
 bits 32
-start_protected_mode:
+pm_start:
     mov ax, 0x10
     mov ds, ax
     mov es, ax
@@ -235,31 +111,21 @@ start_protected_mode:
     mov ss, ax
     mov esp, 0x90000
     
-    ; Pass Boot Parameters (0x8000) to Kernel
-    mov ebx, 0x8000
-
-    ; Copy Kernel to 1MB
+    ; Copy Kernel from 0x10000 to 1MB
     mov esi, 0x10000
-    mov edi, KERNEL_TARGET_ADDR
-    mov ecx, (SECTORS_TO_READ * 512) / 4 
+    mov edi, 0x100000
+    mov ecx, (SECTORS_TO_READ * 512) / 4
     rep movsd
-
-    ; Jump to Kernel
-    ; Ensure kernel_entry.o is linked FIRST
-    jmp KERNEL_TARGET_ADDR
     
-    cli
-    hlt
+    mov ebx, 0x8000 ; Pass Boot Params
+    jmp 0x100000    ; Jump to Kernel
 
-; Variables
-boot_drive db 0
-gdt_start:
-    dd 0x0, 0x0
-    dw 0xFFFF, 0x0000, 0x9A, 0xCF, 0x00
-    dw 0xFFFF, 0x0000, 0x92, 0xCF, 0x00
-gdt_end:
-gdt_descriptor:
-    dw gdt_end - gdt_start - 1
+gdt_start: 
+    dd 0, 0
+    dw 0xFFFF, 0, 0x9A, 0xCF, 0
+    dw 0xFFFF, 0, 0x92, 0xCF, 0
+gdt_descriptor: 
+    dw gdt_start - 1
     dd gdt_start
 
 times 510-($-$$) db 0
