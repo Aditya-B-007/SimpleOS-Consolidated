@@ -550,4 +550,4 @@ struct boot_params {
 };
 typedef struct boot_params BootParams;
 
-#endif // KERNEL_H
+#endif

@@ -1314,18 +1314,18 @@ void paging_install(void) {
     kernel_pml4 = (pt_t*)pmm_alloc_page();
     memset(kernel_pml4, 0, PAGE_SIZE);
 
-    // Map Kernel (0-4MB)
-    for (uint64_t i = 0; i < 0x400000; i += PAGE_SIZE) {
+    // Map first 512MB of physical memory identity to cover Kernel, Heap, and PMM structures (mem_map)
+    // This prevents page faults when accessing memory management structures allocated beyond 4MB.
+    for (uint64_t i = 0; i < 0x20000000; i += PAGE_SIZE) {
         paging_map(i, i, PTE_PRESENT | PTE_RW);
     }
-    // Map Heap (4MB-20MB)
-    for (uint64_t i = 0x00400000; i < 0x01400000; i += PAGE_SIZE) {
-        paging_map(i, i, PTE_PRESENT | PTE_RW);
-    }
+
     // Map Framebuffer
     uint64_t fb_phys = screen_info.physbase;
+    // Calculate actual framebuffer size based on resolution and pitch
+    uint64_t fb_size = (uint64_t)screen_info.pitch * screen_info.resolution_y;
     if (fb_phys != 0) {
-        for (uint64_t i = 0; i < 0x00800000; i += PAGE_SIZE) {
+        for (uint64_t i = 0; i < fb_size; i += PAGE_SIZE) {
             paging_map(fb_phys + i, fb_phys + i, PTE_PRESENT | PTE_RW);
         }
     }
